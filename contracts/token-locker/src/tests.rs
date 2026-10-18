@@ -3,6 +3,8 @@ use soroban_sdk::{
     token, vec, Address, BytesN, Env, IntoVal, Symbol, TryFromVal,
 };
 
+use crate::{ContractError, LockMetadata, TokenLocker, TokenLockerClient, Vesting};
+use locker_common::UPGRADE_DELAY;
 use crate::{ContractError, LockMetadata, TokenLocker, TokenLockerClient, Vesting, MAX_EXTENSIONS};
 
 // ── Test setup ────────────────────────────────────────────────────────────────
@@ -1079,6 +1081,50 @@ fn create_split_lock_emits_a_lock_created_event_per_child() {
     assert_eq!(lock1_event_beneficiary, b2);
 }
 
+/// Issue #901: `get_split_groups_by_creator` had no coverage at all. Create 3
+/// split groups for one creator and exercise a full page, a partial page,
+/// and an out-of-range offset.
+#[test]
+fn get_split_groups_by_creator_paginates_results() {
+    let (env, contract_id, token_id) = setup_env();
+    let client = TokenLockerClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    mint(&env, &token_id, &creator, 30_000);
+    let unlock_at = env.ledger().timestamp() + 100_000;
+
+    let mut group_ids: std::vec::Vec<u64> = std::vec::Vec::new();
+    for _ in 0..3 {
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+        let group_id = client.create_split_lock(
+            &creator,
+            &token_id,
+            &10_000_i128,
+            &vec![&env, (b1, 7_000_u64), (b2, 3_000_u64)],
+            &unlock_at,
+            &None,
+        );
+        group_ids.push(group_id);
+    }
+
+    // Full page: offset=0, limit=10 returns all 3 groups, in creation order.
+    let full = client.get_split_groups_by_creator(&creator, &0, &10);
+    assert_eq!(full.len(), 3);
+    for (i, id) in group_ids.iter().enumerate() {
+        assert_eq!(full.get(i as u32).unwrap().group_id, *id);
+    }
+
+    // Partial page: offset=1, limit=1 returns just the second group.
+    let middle = client.get_split_groups_by_creator(&creator, &1, &1);
+    assert_eq!(middle.len(), 1);
+    assert_eq!(middle.get(0).unwrap().group_id, group_ids[1]);
+
+    // Out-of-range offset returns an empty page, not a panic.
+    let out_of_range = client.get_split_groups_by_creator(&creator, &5, &10);
+    assert_eq!(out_of_range.len(), 0);
+}
+
 // ── Rate limiting (#203 / create_split_lock parity) ───────────────────────────
 
 #[test]
@@ -1747,6 +1793,80 @@ fn execute_upgrade_fails_before_timelock_elapses() {
     assert_eq!(result, Err(Ok(ContractError::TimelockNotElapsed)));
 }
 
+/// Issue #902: exercise the exact timelock boundary rather than a loose
+/// "well before" gap, to catch mutants in the `<` comparison and in the
+/// `now + UPGRADE_DELAY` arithmetic in propose_upgrade/execute_upgrade.
+#[test]
+fn execute_upgrade_fails_one_second_before_timelock_elapses() {
+    let (env, contract_id, _token_id) = setup_env();
+    let client = TokenLockerClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    client.propose_upgrade(&wasm_hash);
+
+    // One second short of the 7-day timelock must still be rejected.
+    advance_time(&env, UPGRADE_DELAY - 1);
+
+    let result = client.try_execute_upgrade();
+    assert_eq!(result, Err(Ok(ContractError::TimelockNotElapsed)));
+}
+
+#[test]
+fn execute_upgrade_succeeds_exactly_at_timelock() {
+    let (env, contract_id, _token_id) = setup_env();
+    let client = TokenLockerClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    client.propose_upgrade(&wasm_hash);
+
+    // Advance time exactly to the 7-day timelock boundary.
+    advance_time(&env, UPGRADE_DELAY);
+
+    // Timing exactly at the delay must no longer be rejected.
+    assert!(client.try_execute_upgrade().is_ok());
+}
+
+/// Issue #902: the stored proposal's earliest-execution time must equal
+/// `now + UPGRADE_DELAY`, not some other arithmetic combination of the two.
+#[test]
+fn propose_upgrade_sets_execute_after_to_now_plus_delay() {
+    let (env, contract_id, _token_id) = setup_env();
+    let client = TokenLockerClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let now = env.ledger().timestamp();
+    let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    client.propose_upgrade(&wasm_hash);
+
+    // Only events this contract published.
+    let our_events: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|(addr, _, _)| *addr == contract_id)
+        .collect();
+
+    let (_, topics, _) = our_events
+        .iter()
+        .find(|(_, topics, _)| {
+            Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap()
+                == Symbol::new(&env, "upgrade_proposed")
+        })
+        .expect("upgrade_proposed event not found")
+        .clone();
+
+    let execute_after: u64 = u64::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(execute_after, now + UPGRADE_DELAY);
+}
+
 #[test]
 fn propose_upgrade_succeeds_after_init() {
     let (env, contract_id, _token_id) = setup_env();
@@ -1777,6 +1897,95 @@ fn cancel_upgrade_clears_pending_proposal() {
     advance_time(&env, 8 * 24 * 3600);
     let result = client.try_execute_upgrade();
     assert_eq!(result, Err(Ok(ContractError::NoPendingUpgrade)));
+}
+
+// ── Pause / unpause (Issue #892) ───────────────────────────────────────────────
+
+#[test]
+fn pause_blocks_create_lock_with_contract_paused() {
+    let (env, contract_id, token_id) = setup_env();
+    let client = TokenLockerClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init(&admin);
+    client.pause();
+
+    let creator = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    mint(&env, &token_id, &creator, 1_000);
+    let unlock_at = env.ledger().timestamp() + 100_000;
+
+    let result = client.try_create_lock(
+        &creator,
+        &token_id,
+        &100_i128,
+        &beneficiary,
+        &unlock_at,
+        &None,
+        &empty_metadata(&env),
+    );
+    assert_eq!(result, Err(Ok(ContractError::ContractPaused)));
+}
+
+#[test]
+fn unpause_restores_normal_create_lock_behaviour() {
+    let (env, contract_id, token_id) = setup_env();
+    let client = TokenLockerClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init(&admin);
+    client.pause();
+    client.unpause();
+
+    let creator = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    mint(&env, &token_id, &creator, 1_000);
+    let unlock_at = env.ledger().timestamp() + 100_000;
+
+    let lock_id = client.create_lock(
+        &creator,
+        &token_id,
+        &100_i128,
+        &beneficiary,
+        &unlock_at,
+        &None,
+        &empty_metadata(&env),
+    );
+    assert!(client.get_lock(&lock_id).is_some(), "create_lock should succeed again after unpause");
+}
+
+/// `pause` reads the admin address from storage rather than taking it as a
+/// parameter, so a non-admin caller can only be simulated by NOT providing a
+/// matching auth entry for the stored admin — `admin.require_auth()` then
+/// panics instead of returning a catchable `Result`, same pattern as
+/// `non_admin_cannot_propose_upgrade` elsewhere in this suite.
+#[test]
+fn non_admin_cannot_pause() {
+    let env = Env::default();
+    let contract_id = env.register(TokenLocker, ());
+    let client = TokenLockerClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: vec![&env, admin.into_val(&env)],
+            sub_invokes: &[],
+        },
+    }]);
+    client.init(&admin);
+
+    // No auths mocked for this call, so admin.require_auth() inside `pause`
+    // has no matching authorization and panics.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let env2 = env.clone();
+        let c2 = TokenLockerClient::new(&env2, &contract_id);
+        c2.pause()
+    }));
+    assert!(result.is_err(), "pause without the admin's authorization must panic");
 }
 
 #[test]

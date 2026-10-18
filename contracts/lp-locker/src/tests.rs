@@ -1,9 +1,48 @@
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Events, Ledger},
     token, Address, Env, IntoVal, Symbol, TryFromVal,
 };
 
-use crate::{ContractError, Dex, LockMetadata, LpLocker, LpLockerClient, Vesting};
+use crate::{verify_pool_tokens, ContractError, Dex, LockMetadata, LpLocker, LpLockerClient, Vesting};
+
+// ── Mock pool contract (Issue #905) ────────────────────────────────────────────
+//
+// `verify_pool_tokens` in lib.rs performs a best-effort cross-contract check
+// against a pool contract's `token_a()`/`token_b()` getters (Aquarius /
+// Soroswap standard). `setup_env`'s `pool_share_id` is a plain Stellar Asset
+// Contract, which doesn't expose those getters, so it only ever exercises the
+// "getters absent -> skip the check" branch. This mock pool exposes the two
+// getters so the match / swapped-order / mismatch branches can be tested too.
+
+#[contract]
+pub struct MockPool;
+
+#[contractimpl]
+impl MockPool {
+    pub fn __constructor(env: Env, token_a: Address, token_b: Address) {
+        env.storage().instance().set(&Symbol::new(&env, "token_a"), &token_a);
+        env.storage().instance().set(&Symbol::new(&env, "token_b"), &token_b);
+    }
+
+    pub fn token_a(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "token_a"))
+            .expect("token_a not set")
+    }
+
+    pub fn token_b(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "token_b"))
+            .expect("token_b not set")
+    }
+}
+
+fn register_mock_pool(env: &Env, token_a: &Address, token_b: &Address) -> Address {
+    env.register(MockPool, (token_a.clone(), token_b.clone()))
+}
 
 // ── Test setup ────────────────────────────────────────────────────────────────
 
@@ -2540,6 +2579,58 @@ fn create_split_lock_accepts_exactly_max_beneficiaries() {
     assert_eq!(group.unwrap().lock_ids.len(), 10);
 }
 
+// ── verify_pool_tokens (Issue #905) ────────────────────────────────────────────
+
+#[test]
+fn verify_pool_tokens_accepts_matching_tokens() {
+    let env = Env::default();
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    let pool = register_mock_pool(&env, &token_a, &token_b);
+
+    assert_eq!(verify_pool_tokens(&env, &pool, &token_a, &token_b), Ok(()));
+}
+
+#[test]
+fn verify_pool_tokens_accepts_swapped_order() {
+    let env = Env::default();
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    // Pool reports (token_a, token_b) but the caller supplies them as (B, A) —
+    // pool contracts don't guarantee a canonical ordering, so this must pass.
+    let pool = register_mock_pool(&env, &token_a, &token_b);
+
+    assert_eq!(verify_pool_tokens(&env, &pool, &token_b, &token_a), Ok(()));
+}
+
+#[test]
+fn verify_pool_tokens_rejects_mismatched_token() {
+    let env = Env::default();
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    let unrelated = Address::generate(&env);
+    let pool = register_mock_pool(&env, &token_a, &token_b);
+
+    assert_eq!(
+        verify_pool_tokens(&env, &pool, &token_a, &unrelated),
+        Err(ContractError::InvalidPoolTokens)
+    );
+    assert_eq!(
+        verify_pool_tokens(&env, &pool, &unrelated, &token_b),
+        Err(ContractError::InvalidPoolTokens)
+    );
+}
+
+#[test]
+fn verify_pool_tokens_accepts_pool_without_getters() {
+    // `setup_env`'s pool_share_id is a plain Stellar Asset Contract, which has
+    // no token_a()/token_b() getters — the check must be skipped, not fail.
+    let (env, _contract_id, pool_share_id, token_a, token_b) = setup_env();
+
+    assert_eq!(
+        verify_pool_tokens(&env, &pool_share_id, &token_a, &token_b),
+        Ok(())
+    );
 // ── extend MAX_EXTENSIONS boundary (#910) ────────────────────────────────────
 
 #[test]
