@@ -27,6 +27,8 @@
     "dev:testnet": "cp .env.testnet .env && vite --host",
     "dev:staging": "cp .env.staging .env && vite --host",
     "build": "tsc -b && vite build",
+    "check:bundle-size": "node scripts/check-bundle-size.mjs",
+    "build:budget": "pnpm build && pnpm check:bundle-size",
     "build:testnet": "cp .env.testnet .env && tsc -b && vite build",
     "build:staging": "cp .env.staging .env && tsc -b && vite build",
     "build:mainnet": "cp .env.mainnet .env && tsc -b && vite build",

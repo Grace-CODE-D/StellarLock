@@ -49,6 +49,8 @@ function mockLockOne(page: Page) {
       get_lock: (args) => (args[0].u64().toString() === "1" ? MOCK_LOCK : null),
       // extend returns void.
       extend: xdr.ScVal.scvVoid(),
+      // transfer_beneficiary returns void.
+      transfer_beneficiary: xdr.ScVal.scvVoid(),
     },
   })
 }
@@ -152,5 +154,27 @@ test.describe("Lock Detail Page", () => {
     // After confirmation the panel closes and the "extend" contract function was called.
     await expect(page.getByRole("region", { name: /Extend/i })).toHaveCount(0)
     expect(invoked).toContain("extend")
+  })
+
+  test("Beneficiary can transfer the lock and sees the updated UI", async ({ page }) => {
+    const newBeneficiary = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBWHF"
+    await mockConnectedWallet(page)
+    const invoked = await mockLockOne(page)
+    const detail = new LockDetailPage(page)
+    await detail.goto("1")
+    await expect(detail.tokenHeading("MOCK")).toBeVisible()
+
+    // The connected wallet is MOCK_LOCK's beneficiary, so it can transfer the lock.
+    await expect(page.getByRole("button", { name: /Transfer beneficiary/i })).toBeVisible()
+    await page.getByRole("button", { name: /Transfer beneficiary/i }).click()
+    const transferPanel = page.getByRole("region", { name: /Transfer beneficiary/i })
+    await expect(transferPanel).toBeVisible()
+    await page.getByLabel(/New beneficiary address/i).fill(newBeneficiary)
+    await page.getByRole("button", { name: /Confirm transfer/i }).click()
+
+    // A successful transfer closes the panel and announces the updated state.
+    await expect(transferPanel).toHaveCount(0)
+    await expect(page.locator('[role="status"][aria-live="polite"]')).toContainText("Beneficiary transferred.")
+    expect(invoked).toContain("transfer_beneficiary")
   })
 })
